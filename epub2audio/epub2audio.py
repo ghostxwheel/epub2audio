@@ -4,6 +4,7 @@
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Union
 
@@ -49,6 +50,7 @@ class Epub2Audio:
         convert: bool = True,
         max_chapters: int = -1,
         format: str = "ogg",
+        chapter_workers: int = 3,
     ):
         """Creates an AudioBook from an Epub.
 
@@ -62,6 +64,10 @@ class Epub2Audio:
             convert: Whether to convert the epub immediately
             max_chapters: Maximum number of chapters to process, or -1 for no limit.
             format: Format to use for the output file.
+            chapter_workers: Number of chapters to generate TTS audio for
+                concurrently. GPU inference releases the GIL, so overlapping
+                a chapter's CPU-bound phonemization with another chapter's
+                GPU inference improves throughput. Set to 1 to disable.
         """
         self.cache = cache
         self.quiet = quiet
@@ -69,6 +75,7 @@ class Epub2Audio:
         self.voice = voice
         self.speech_rate = speech_rate
         self.max_chapters = max_chapters
+        self.chapter_workers = chapter_workers
         self.extension = f".{format}"
         if (
             output_path
@@ -155,31 +162,40 @@ class Epub2Audio:
                     ROMAN_REGEX, f"Chapter {chapter_number} ", chapter.title
                 )
 
-    def _process_epub_chapter(self, chapter: Chapter) -> None:
-        if self.max_chapters > 0 and len(self.chapters) > self.max_chapters:
-            logger.info(f"Skipping chapter {chapter.title} as max chapters reached")
-            return
+    def _generate_chapter_audio(self, chapter: Chapter) -> tuple[SoundFile, SoundFile]:
+        """Generate the announcement and content audio for a chapter.
 
-        # Generate chapter announcement
+        Safe to call concurrently from multiple threads: touches only
+        `self.converter` (read-only aside from its own cache bookkeeping)
+        and returns results rather than mutating shared book-level state.
+        """
         announcement = self.converter.convert_text(chapter.title)
-        self.audio_segments.append(announcement)
         logger.debug(
             f"Chapter: '{chapter.title}' "
             f"announcement duration: {get_duration(announcement)}"
         )
 
-        # Convert chapter text
         logger.trace(
             f"start converting chapter '{chapter.title}' content: "
             f"{len(chapter.content)}"
         )
         chapter_audio = self.converter.convert_text(chapter.content)
-        self.audio_segments.append(chapter_audio)
         logger.debug(
             f"Chapter: '{chapter.title}' audio duration: {get_duration(chapter_audio)}"
         )
+        return announcement, chapter_audio
 
-        # Add chapter marker
+    def _record_chapter_audio(
+        self, chapter: Chapter, announcement: SoundFile, chapter_audio: SoundFile
+    ) -> None:
+        """Append audio segments and record the chapter marker, in book order.
+
+        Must be called sequentially in chapter order, since chapter markers
+        and audio_segments ordering depend on it.
+        """
+        self.audio_segments.append(announcement)
+        self.audio_segments.append(chapter_audio)
+
         start_time = self.current_audibook_time
         self.current_audibook_time += get_duration(announcement) + get_duration(
             chapter_audio
@@ -187,6 +203,13 @@ class Epub2Audio:
         self.audio_handler.add_chapter_marker(
             chapter.title, start_time, self.current_audibook_time
         )
+
+    def _process_epub_chapter(self, chapter: Chapter) -> None:
+        if self.max_chapters > 0 and len(self.chapters) > self.max_chapters:
+            logger.info(f"Skipping chapter {chapter.title} as max chapters reached")
+            return
+        announcement, chapter_audio = self._generate_chapter_audio(chapter)
+        self._record_chapter_audio(chapter, announcement, chapter_audio)
 
     def convert(self) -> None:
         """Process an EPUB file and convert it to an audiobook.
@@ -212,9 +235,31 @@ class Epub2Audio:
             disable=self.quiet,
             unit="chars",
         ) as pbar:
-            for chapter in self.chapters:
-                self._process_epub_chapter(chapter)
-                pbar.update(len(chapter.content))
+            if self.max_chapters > 0 and len(self.chapters) > self.max_chapters:
+                # Preserve original behavior: skip every chapter once the
+                # book exceeds max_chapters.
+                for chapter in self.chapters:
+                    logger.info(
+                        f"Skipping chapter {chapter.title} as max chapters reached"
+                    )
+                    pbar.update(len(chapter.content))
+            elif self.chapter_workers > 1:
+                # Generate chapters concurrently (CPU phonemization overlaps
+                # with GPU inference across chapters), but record results
+                # sequentially in book order so markers/segments stay correct.
+                with ThreadPoolExecutor(max_workers=self.chapter_workers) as executor:
+                    futures = [
+                        executor.submit(self._generate_chapter_audio, chapter)
+                        for chapter in self.chapters
+                    ]
+                    for chapter, future in zip(self.chapters, futures):
+                        announcement, chapter_audio = future.result()
+                        self._record_chapter_audio(chapter, announcement, chapter_audio)
+                        pbar.update(len(chapter.content))
+            else:
+                for chapter in self.chapters:
+                    self._process_epub_chapter(chapter)
+                    pbar.update(len(chapter.content))
 
         # Concatenate all audio segments
         if not self.quiet:

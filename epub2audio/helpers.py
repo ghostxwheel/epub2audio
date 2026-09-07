@@ -20,6 +20,16 @@ ROMAN_REGEX = re.compile(r"^[C|c]hapter\s+(?P<number>[ivxclm]+)\s")
 
 
 @dataclass
+class WordTiming:
+    """A single word and its start/end time within an audio segment."""
+
+    text: str
+    start: float
+    end: float
+    trailing_space: bool = True
+
+
+@dataclass
 class ConversionWarning:
     """Class for storing warning information during conversion."""
 

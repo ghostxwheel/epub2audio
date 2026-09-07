@@ -1,7 +1,9 @@
 """Text-to-speech conversion using Kokoro."""
 
+import json
 import os
 from collections.abc import Generator
+from dataclasses import asdict
 from pathlib import Path
 from typing import Union
 
@@ -20,6 +22,7 @@ from .helpers import (
     CacheDirManager,
     ConversionError,
     StrPath,
+    WordTiming,
 )
 from .voices import Voice
 
@@ -164,6 +167,88 @@ class AudioConverter:
             audio_data.close()
             os.rename(f"{temp_file}.generating", temp_file)
             return SoundFile(temp_file)
+
+        except Exception as e:
+            raise ConversionError(
+                f"Failed to convert text to speech: {str(e)}", ErrorCodes.UNKNOWN_ERROR
+            ) from e
+
+    def convert_text_with_timing(
+        self, text: str
+    ) -> tuple[SoundFile, list[WordTiming]]:
+        """Convert text to speech, also returning word-level timing.
+
+        Timing comes from Kokoro's per-token alignment, which is already
+        computed during inference but normally discarded. It is cached
+        alongside the audio segment as a JSON sidecar (`<segment>.timing.json`)
+        so cache hits still return timing without re-running TTS; a cache
+        hit whose sidecar predates this feature returns an empty list.
+
+        Args:
+            text: Text to convert
+
+        Returns:
+            tuple[SoundFile, list[WordTiming]]: Converted audio and the
+                word timings, relative to the start of this audio.
+        """
+        try:
+            temp_file = self.cache_dir_manager.get_file(text)
+            timing_file = f"{temp_file}.timing.json"
+
+            if os.path.exists(temp_file) and self.cache:
+                logger.trace(f"returning cached file: {temp_file}")
+                words: list[WordTiming] = []
+                if os.path.exists(timing_file):
+                    with open(timing_file, encoding="utf-8") as f:
+                        words = [WordTiming(**w) for w in json.load(f)]
+                return SoundFile(temp_file), words
+
+            if os.path.exists(f"{temp_file}.generating"):
+                logger.trace(f"removing generating file: {temp_file}.generating")
+                os.remove(f"{temp_file}.generating")
+
+            audio_data = SoundFile(
+                f"{temp_file}.generating",
+                mode="w",
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                format=self.format,
+                subtype=self.subtype,
+            )
+            int_size = np.int16
+            max_int_size = np.iinfo(int_size).max
+            words = []
+            frames_written = 0
+            for result in self._audio_data_generator(text):
+                audio = result.audio
+                if audio is None:
+                    continue
+                chunk_offset = frames_written / SAMPLE_RATE
+                for token in result.tokens or []:
+                    if token.start_ts is None or token.end_ts is None:
+                        continue
+                    word_text = token.text.strip()
+                    if not word_text:
+                        continue
+                    words.append(
+                        WordTiming(
+                            text=word_text,
+                            start=chunk_offset + token.start_ts,
+                            end=chunk_offset + token.end_ts,
+                            trailing_space=bool(token.whitespace),
+                        )
+                    )
+                audio_bytes = (audio.numpy() * max_int_size).astype(int_size)
+                audio_data.write(audio_bytes)
+                frames_written += len(audio_bytes)
+
+            audio_data.close()
+            os.rename(f"{temp_file}.generating", temp_file)
+
+            with open(timing_file, "w", encoding="utf-8") as f:
+                json.dump([asdict(w) for w in words], f)
+
+            return SoundFile(temp_file), words
 
         except Exception as e:
             raise ConversionError(

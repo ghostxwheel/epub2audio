@@ -16,6 +16,7 @@ from tqdm import tqdm  # type: ignore
 
 from .audio_converter import AudioConverter
 from .audio_handler import AudioHandler
+from .captions import group_words_into_cues, write_srt, write_vtt
 from .config import (
     DEFAULT_LOGGER_ID,
     DEFAULT_SPEECH_RATE,
@@ -27,6 +28,7 @@ from .helpers import (
     AudioHandlerError,
     ConversionError,
     StrPath,
+    WordTiming,
     check_disk_space,
     clean_filename,
     ensure_dir_exists,
@@ -51,6 +53,7 @@ class Epub2Audio:
         max_chapters: int = -1,
         format: str = "ogg",
         chapter_workers: int = 3,
+        generate_captions: bool = False,
     ):
         """Creates an AudioBook from an Epub.
 
@@ -68,6 +71,10 @@ class Epub2Audio:
                 concurrently. GPU inference releases the GIL, so overlapping
                 a chapter's CPU-bound phonemization with another chapter's
                 GPU inference improves throughput. Set to 1 to disable.
+            generate_captions: Whether to also write a per-chapter .srt and
+                .vtt transcript (word-level timing from Kokoro's own
+                alignment) alongside the output audio, in a `captions`
+                subdirectory next to the output file.
         """
         self.cache = cache
         self.quiet = quiet
@@ -76,6 +83,7 @@ class Epub2Audio:
         self.speech_rate = speech_rate
         self.max_chapters = max_chapters
         self.chapter_workers = chapter_workers
+        self.generate_captions = generate_captions
         self.extension = f".{format}"
         if (
             output_path
@@ -162,14 +170,28 @@ class Epub2Audio:
                     ROMAN_REGEX, f"Chapter {chapter_number} ", chapter.title
                 )
 
-    def _generate_chapter_audio(self, chapter: Chapter) -> tuple[SoundFile, SoundFile]:
+    def _generate_chapter_audio(
+        self, chapter: Chapter
+    ) -> tuple[SoundFile, SoundFile, list[WordTiming]]:
         """Generate the announcement and content audio for a chapter.
 
         Safe to call concurrently from multiple threads: touches only
         `self.converter` (read-only aside from its own cache bookkeeping)
         and returns results rather than mutating shared book-level state.
+
+        Returns:
+            tuple[SoundFile, SoundFile, list[WordTiming]]: The announcement
+                audio, the content audio, and (if captions are enabled)
+                word timings covering both, relative to this chapter's own
+                audio start (announcement, then content).
         """
-        announcement = self.converter.convert_text(chapter.title)
+        if self.generate_captions:
+            announcement, announcement_words = (
+                self.converter.convert_text_with_timing(chapter.title)
+            )
+        else:
+            announcement = self.converter.convert_text(chapter.title)
+            announcement_words = []
         logger.debug(
             f"Chapter: '{chapter.title}' "
             f"announcement duration: {get_duration(announcement)}"
@@ -179,14 +201,39 @@ class Epub2Audio:
             f"start converting chapter '{chapter.title}' content: "
             f"{len(chapter.content)}"
         )
-        chapter_audio = self.converter.convert_text(chapter.content)
+        if self.generate_captions:
+            chapter_audio, content_words = self.converter.convert_text_with_timing(
+                chapter.content
+            )
+        else:
+            chapter_audio = self.converter.convert_text(chapter.content)
+            content_words = []
         logger.debug(
             f"Chapter: '{chapter.title}' audio duration: {get_duration(chapter_audio)}"
         )
-        return announcement, chapter_audio
+
+        words = list(announcement_words)
+        if content_words:
+            # Force a space between the announcement and content, even if
+            # the announcement's own last word didn't naturally end with
+            # one (e.g. a single-word title like "1" has no trailing
+            # whitespace in isolation).
+            if words:
+                last = words[-1]
+                words[-1] = WordTiming(last.text, last.start, last.end, True)
+            offset = get_duration(announcement)
+            words.extend(
+                WordTiming(w.text, w.start + offset, w.end + offset, w.trailing_space)
+                for w in content_words
+            )
+        return announcement, chapter_audio, words
 
     def _record_chapter_audio(
-        self, chapter: Chapter, announcement: SoundFile, chapter_audio: SoundFile
+        self,
+        chapter: Chapter,
+        announcement: SoundFile,
+        chapter_audio: SoundFile,
+        words: list[WordTiming],
     ) -> None:
         """Append audio segments and record the chapter marker, in book order.
 
@@ -195,6 +242,8 @@ class Epub2Audio:
         """
         self.audio_segments.append(announcement)
         self.audio_segments.append(chapter_audio)
+        if self.generate_captions:
+            self.chapter_captions.append((chapter, words))
 
         start_time = self.current_audibook_time
         self.current_audibook_time += get_duration(announcement) + get_duration(
@@ -208,8 +257,32 @@ class Epub2Audio:
         if self.max_chapters > 0 and len(self.chapters) > self.max_chapters:
             logger.info(f"Skipping chapter {chapter.title} as max chapters reached")
             return
-        announcement, chapter_audio = self._generate_chapter_audio(chapter)
-        self._record_chapter_audio(chapter, announcement, chapter_audio)
+        announcement, chapter_audio, words = self._generate_chapter_audio(chapter)
+        self._record_chapter_audio(chapter, announcement, chapter_audio, words)
+
+    def _write_captions(self) -> None:
+        """Write per-chapter .srt/.vtt transcripts from captured word timing.
+
+        File basenames ("NN - Chapter Title") match the per-chapter audio
+        files a chapter-splitting post-process (e.g. ffmpeg) would produce
+        from this book's chapter markers, so they pair up as sidecars once
+        placed alongside those files.
+        """
+        if not self.chapter_captions:
+            return
+        captions_dir = self.output_path.parent / "captions"
+        ensure_dir_exists(captions_dir)
+        for idx, (chapter, words) in enumerate(self.chapter_captions, 1):
+            if not words:
+                continue
+            cues = group_words_into_cues(words)
+            base_name = re.sub(r'[<>:"/\\|?*]', "_", f"{idx:02d} - {chapter.title}")[
+                :150
+            ].strip()
+            write_srt(cues, captions_dir / f"{base_name}.srt")
+            write_vtt(cues, captions_dir / f"{base_name}.vtt")
+        logger.info(f"Wrote captions for {len(self.chapter_captions)} chapters to "
+                    f"{captions_dir}")
 
     def convert(self) -> None:
         """Process an EPUB file and convert it to an audiobook.
@@ -228,6 +301,7 @@ class Epub2Audio:
         # Process chapters
         self.current_audibook_time = 0.0
         self.audio_segments: list[SoundFile] = []
+        self.chapter_captions: list[tuple[Chapter, list[WordTiming]]] = []
 
         with tqdm(
             total=get_book_length(self.chapters),
@@ -253,8 +327,10 @@ class Epub2Audio:
                         for chapter in self.chapters
                     ]
                     for chapter, future in zip(self.chapters, futures):
-                        announcement, chapter_audio = future.result()
-                        self._record_chapter_audio(chapter, announcement, chapter_audio)
+                        announcement, chapter_audio, words = future.result()
+                        self._record_chapter_audio(
+                            chapter, announcement, chapter_audio, words
+                        )
                         pbar.update(len(chapter.content))
             else:
                 for chapter in self.chapters:
@@ -266,6 +342,9 @@ class Epub2Audio:
             logger.info("Finalizing audio file...")
 
         self.audio_handler.finalize_audio_file(self.audio_segments)
+
+        if self.generate_captions:
+            self._write_captions()
 
         # Clean up cache files
         if not self.cache:
@@ -301,6 +380,7 @@ def process_epub(
     convert: bool = True,
     max_chapters: int = -1,
     format: str = "flac",
+    generate_captions: bool = False,
 ) -> Epub2Audio:
     """Process an EPUB file and convert it to an audiobook.
 
@@ -314,6 +394,8 @@ def process_epub(
         convert: Whether to convert the epub immediately
         max_chapters: Maximum number of chapters to process, or -1 for no limit.
         format: Format to use for the output file.
+        generate_captions: Whether to also write per-chapter .srt/.vtt
+            transcripts alongside the output audio.
     """
     return Epub2Audio(
         input_epub,
@@ -325,6 +407,7 @@ def process_epub(
         convert=convert,
         max_chapters=max_chapters,
         format=format,
+        generate_captions=generate_captions,
     )
 
 
@@ -376,6 +459,11 @@ def process_epub(
     default=-1,
     show_default=True,
 )
+@click.option(
+    "--captions",
+    is_flag=True,
+    help="Also write per-chapter .srt/.vtt transcripts alongside the audio.",
+)
 @click.version_option()
 def main(
     input_epub: Path,
@@ -385,6 +473,7 @@ def main(
     quiet: bool,
     cache: bool,
     verbose: int,
+    captions: bool = False,
     convert: bool = True,
     max_chapters: int = -1,
     format: str = "flac",
@@ -423,6 +512,7 @@ def main(
             convert,
             max_chapters,
             format,
+            captions,
         )
     except ConversionError as e:
         logger.exception(e)
